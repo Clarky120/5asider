@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as matches from "../matches.js";
 import type * as players from "../players.js";
 
 import type {
@@ -17,6 +18,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  matches: typeof matches;
   players: typeof players;
 }>;
 
