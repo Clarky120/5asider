@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
-
-const STORAGE_KEY = "5asider.players";
+import { useState } from "react";
+import { useQuery, useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
 
 /** Fisher-Yates shuffle - returns a new array, does not mutate the input. */
 function shuffle(list) {
@@ -22,61 +22,39 @@ function drawTeams(pool) {
   };
 }
 
-function loadPlayers() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
 export default function App() {
-  const [players, setPlayers] = useState(loadPlayers);
-  const [name, setName] = useState("");
+  const players = useQuery(api.players.list);
+  const addPlayer = useMutation(api.players.add);
+  const removePlayer = useMutation(api.players.remove);
+
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [error, setError] = useState("");
   const [teams, setTeams] = useState(null);
 
-  useEffect(() => {
+  const isLoading = players === undefined;
+  const pool = players ?? [];
+  const canDraw = pool.length >= 2;
+
+  const handleAdd = async () => {
+    setError("");
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(players));
-    } catch {
-      // ignore write failures (private mode, quota, etc.)
+      await addPlayer({ firstName, lastName });
+      setFirstName("");
+      setLastName("");
+    } catch (err) {
+      setError(err.message?.replace(/^\[.*?\]\s*/, "") || "Could not add player.");
     }
-  }, [players]);
-
-  const addPlayer = () => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    const exists = players.some(
-      (p) => p.name.toLowerCase() === trimmed.toLowerCase()
-    );
-    if (exists) {
-      setName("");
-      return;
-    }
-    setPlayers((current) => [
-      ...current,
-      { id: crypto.randomUUID(), name: trimmed },
-    ]);
-    setName("");
   };
 
-  const removePlayer = (id) => {
-    setPlayers((current) => current.filter((p) => p.id !== id));
-  };
-
-  const clearAll = () => {
-    setPlayers([]);
+  const handleRemove = async (id) => {
+    await removePlayer({ id });
     setTeams(null);
   };
 
   const handleDraw = () => {
-    setTeams(drawTeams(players));
+    setTeams(drawTeams(pool));
   };
-
-  const canDraw = players.length >= 2;
 
   return (
     <div
@@ -101,7 +79,9 @@ export default function App() {
               className="text-sm text-emerald-800/70 mt-3"
               style={{ fontFamily: "Inter" }}
             >
-              {players.length} {players.length === 1 ? "player" : "players"} in the pool
+              {isLoading
+                ? "Loading players…"
+                : `${pool.length} ${pool.length === 1 ? "player" : "players"} in the pool`}
             </p>
           </div>
 
@@ -118,55 +98,78 @@ export default function App() {
               </h2>
               <div className="flex gap-2">
                 <input
-                  className="flex-1 border border-gray-200 px-4 py-3 rounded-xl text-gray-800 placeholder-gray-300 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20 transition-all"
-                  placeholder="ex. Liam Clark"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addPlayer()}
+                  className="flex-1 min-w-0 border border-gray-200 px-4 py-3 rounded-xl text-gray-800 placeholder-gray-300 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20 transition-all"
+                  placeholder="First name"
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+                  style={{ fontFamily: "Inter" }}
+                />
+                <input
+                  className="flex-1 min-w-0 border border-gray-200 px-4 py-3 rounded-xl text-gray-800 placeholder-gray-300 focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20 transition-all"
+                  placeholder="Last name"
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAdd()}
                   style={{ fontFamily: "Inter" }}
                 />
                 <button
                   className="bg-emerald-600 hover:bg-emerald-700 hover:shadow-lg hover:shadow-emerald-600/30 active:scale-[0.98] text-white px-5 rounded-xl font-medium tracking-wide transition-all duration-200"
-                  onClick={addPlayer}
+                  onClick={handleAdd}
                   style={{ fontFamily: "Inter" }}
                 >
                   Add
                 </button>
               </div>
 
-              {players.length > 0 && (
+              {error && (
+                <p
+                  className="text-sm text-red-500"
+                  style={{ fontFamily: "Inter" }}
+                >
+                  {error}
+                </p>
+              )}
+
+              {pool.length > 0 && (
                 <ul className="space-y-2">
-                  {players.map((player) => (
+                  {pool.map((player) => (
                     <li
-                      key={player.id}
-                      className="flex items-center justify-between bg-gray-50 border border-gray-100 rounded-xl px-4 py-2.5"
+                      key={player._id}
+                      className="flex items-center justify-between gap-3 bg-gray-50 border border-gray-100 rounded-xl px-4 py-2.5"
                     >
                       <span
-                        className="text-gray-800 text-sm"
+                        className="text-gray-800 text-sm truncate"
                         style={{ fontFamily: "Inter" }}
                       >
-                        {player.name}
+                        {player.firstName} {player.lastName}
                       </span>
-                      <button
-                        className="text-gray-300 hover:text-red-400 transition-colors text-lg leading-none"
-                        onClick={() => removePlayer(player.id)}
-                        aria-label={`Remove ${player.name}`}
-                      >
-                        &times;
-                      </button>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <span
+                          className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-full px-2 py-0.5"
+                          style={{ fontFamily: "Inter" }}
+                          title="ELO rating"
+                        >
+                          {player.elo}
+                        </span>
+                        <span
+                          className="text-xs text-gray-400"
+                          style={{ fontFamily: "Inter" }}
+                          title="Wins – losses"
+                        >
+                          {player.wins}W&nbsp;{player.losses}L
+                        </span>
+                        <button
+                          className="text-gray-300 hover:text-red-400 transition-colors text-lg leading-none"
+                          onClick={() => handleRemove(player._id)}
+                          aria-label={`Remove ${player.firstName} ${player.lastName}`}
+                        >
+                          &times;
+                        </button>
+                      </div>
                     </li>
                   ))}
                 </ul>
-              )}
-
-              {players.length > 0 && (
-                <button
-                  className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
-                  onClick={clearAll}
-                  style={{ fontFamily: "Inter" }}
-                >
-                  Clear all players
-                </button>
               )}
             </div>
 
@@ -194,7 +197,7 @@ export default function App() {
                 {teams ? "Redraw teams" : "Draw teams"}
               </button>
 
-              {!canDraw && (
+              {!canDraw && !isLoading && (
                 <p
                   className="text-center text-sm text-gray-400"
                   style={{ fontFamily: "Inter" }}
@@ -225,7 +228,7 @@ export default function App() {
               className="text-center text-gray-300 text-xs leading-relaxed"
               style={{ fontFamily: "Inter" }}
             >
-              Coming soon: ELO ratings, match history and saved seasons.
+              Coming soon: ELO changes after matches, match history and saved seasons.
             </p>
 
           </div>
@@ -236,25 +239,22 @@ export default function App() {
 }
 
 function TeamCard({ title, players, accent, badge }) {
+  const avgElo = players.length
+    ? Math.round(players.reduce((sum, p) => sum + p.elo, 0) / players.length)
+    : 0;
+
   return (
     <div className={`rounded-2xl border p-4 ${accent}`}>
       <div className="flex items-center gap-2 mb-3">
         <span className={`w-3 h-3 rounded-full ${badge}`}></span>
-        <h3
-          className="text-lg"
-          style={{ fontFamily: "Playfair Display" }}
-        >
+        <h3 className="text-lg" style={{ fontFamily: "Playfair Display" }}>
           {title}
         </h3>
       </div>
       <ul className="space-y-1.5">
         {players.map((player) => (
-          <li
-            key={player.id}
-            className="text-sm"
-            style={{ fontFamily: "Inter" }}
-          >
-            {player.name}
+          <li key={player._id} className="text-sm" style={{ fontFamily: "Inter" }}>
+            {player.firstName} {player.lastName}
           </li>
         ))}
         {players.length === 0 && (
@@ -263,6 +263,9 @@ function TeamCard({ title, players, accent, badge }) {
           </li>
         )}
       </ul>
+      <p className="text-xs opacity-60 mt-3" style={{ fontFamily: "Inter" }}>
+        Avg ELO {avgElo}
+      </p>
     </div>
   );
 }
