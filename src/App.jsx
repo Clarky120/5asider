@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "convex/react";
 import { api } from "../convex/_generated/api";
+import { winChance } from "../convex/elo";
 
 /** Fisher-Yates shuffle - returns a new array, does not mutate the input. */
 function shuffle(list) {
@@ -12,11 +13,47 @@ function shuffle(list) {
   return copy;
 }
 
-/** Split a pool of players into two roughly even teams. */
-function drawTeams(pool) {
-  const shuffled = shuffle(pool);
-  const half = Math.ceil(shuffled.length / 2);
-  return { a: shuffled.slice(0, half), b: shuffled.slice(half) };
+const teamElo = (team) => team.reduce((sum, p) => sum + p.elo, 0);
+
+/**
+ * Split a pool into two ELO-balanced teams, sized as evenly as possible
+ * (the odd player out goes to team A).
+ *
+ * There's no single "correct" split when several players could go either
+ * way, so this tries a batch of random orderings, greedily dropping each
+ * player onto whichever team currently has the lower total ELO (once a
+ * team hits its target size, the rest go to the other one), then keeps
+ * whichever attempt(s) came out most even. Picking randomly among the
+ * best attempts keeps redraws from being pure noise while still avoiding
+ * the same two teams every time.
+ */
+function drawTeams(pool, trials = 200) {
+  const sizeA = Math.ceil(pool.length / 2);
+  const sizeB = pool.length - sizeA;
+
+  let bestDiff = Infinity;
+  let bestSplits = [];
+
+  for (let t = 0; t < trials; t++) {
+    const a = [];
+    const b = [];
+    for (const player of shuffle(pool)) {
+      if (a.length >= sizeA) b.push(player);
+      else if (b.length >= sizeB) a.push(player);
+      else if (teamElo(a) <= teamElo(b)) a.push(player);
+      else b.push(player);
+    }
+
+    const diff = Math.abs(teamElo(a) - teamElo(b));
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestSplits = [{ a, b }];
+    } else if (diff === bestDiff) {
+      bestSplits.push({ a, b });
+    }
+  }
+
+  return bestSplits[Math.floor(Math.random() * bestSplits.length)];
 }
 
 const fullName = (p) => `${p.firstName} ${p.lastName}`;
@@ -25,6 +62,14 @@ const avgElo = (players) =>
   players.length
     ? Math.round(players.reduce((sum, p) => sum + p.elo, 0) / players.length)
     : 0;
+
+/** Each side's predicted chance to win this matchup, based on average ELO. */
+function matchupChances(teamA, teamB) {
+  if (!teamA.length || !teamB.length) return null;
+  const avgA = avgElo(teamA);
+  const avgB = avgElo(teamB);
+  return { a: winChance(avgA, avgB), b: winChance(avgB, avgA) };
+}
 
 /** Pull the useful sentence out of a Convex error string. */
 function cleanErr(err) {
@@ -102,15 +147,47 @@ function PoolView({ onOpenMatch }) {
   const [error, setError] = useState("");
   const [teams, setTeams] = useState(null);
   const [busy, setBusy] = useState(false);
+  // Which saved players are in for this match's draw (set of player ids).
+  const [picked, setPicked] = useState(() => new Set());
+  const [seeded, setSeeded] = useState(false);
 
   const isLoading = players === undefined;
   const pool = players ?? [];
-  const canDraw = pool.length >= 2;
+
+  // Start with everyone ticked the first time the pool loads.
+  useEffect(() => {
+    if (seeded || players === undefined) return;
+    setPicked(new Set(players.map((p) => p._id)));
+    setSeeded(true);
+  }, [seeded, players]);
+
+  const lineup = pool.filter((p) => picked.has(p._id));
+  const canDraw = lineup.length >= 2;
+
+  const togglePicked = (id) => {
+    setPicked((current) => {
+      const next = new Set(current);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+    setTeams(null);
+  };
+
+  const pickAll = () => {
+    setPicked(new Set(pool.map((p) => p._id)));
+    setTeams(null);
+  };
+
+  const pickNone = () => {
+    setPicked(new Set());
+    setTeams(null);
+  };
 
   const handleAdd = async () => {
     setError("");
     try {
-      await addPlayer({ firstName, lastName });
+      const id = await addPlayer({ firstName, lastName });
+      setPicked((current) => new Set(current).add(id));
       setFirstName("");
       setLastName("");
     } catch (err) {
@@ -120,10 +197,17 @@ function PoolView({ onOpenMatch }) {
 
   const handleRemove = async (id) => {
     await removePlayer({ id });
+    setPicked((current) => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
     setTeams(null);
   };
 
-  const handleDraw = () => setTeams(drawTeams(pool));
+  const handleDraw = () => setTeams(drawTeams(lineup));
+
+  const chances = teams ? matchupChances(teams.a, teams.b) : null;
 
   const handleSaveMatch = async () => {
     if (!teams) return;
@@ -148,13 +232,15 @@ function PoolView({ onOpenMatch }) {
       subtitle={
         isLoading
           ? "Loading players…"
-          : `${pool.length} ${pool.length === 1 ? "player" : "players"} in the pool`
+          : pool.length === 0
+            ? "Add players to get started"
+            : `${lineup.length} of ${pool.length} players picked for the draw`
       }
     >
-      {/* Add players */}
+      {/* Players */}
       <div className="space-y-4">
         <h2 className="text-2xl text-gray-800" style={{ fontFamily: "Playfair Display" }}>
-          Add players
+          Players
         </h2>
         <div className="flex gap-2">
           <input
@@ -189,44 +275,82 @@ function PoolView({ onOpenMatch }) {
         )}
 
         {pool.length > 0 && (
-          <ul className="space-y-2">
-            {pool.map((player) => (
-              <li
-                key={player._id}
-                className="flex items-center justify-between gap-3 bg-gray-50 border border-gray-100 rounded-xl px-4 py-2.5"
-              >
-                <span
-                  className="text-gray-800 text-sm truncate"
-                  style={{ fontFamily: "Inter" }}
+          <>
+            <div className="flex items-center justify-between text-xs" style={{ fontFamily: "Inter" }}>
+              <span className="text-gray-500">
+                {lineup.length} of {pool.length} playing
+              </span>
+              <span className="flex gap-3">
+                <button
+                  className="text-emerald-700 hover:text-emerald-800 disabled:text-gray-300"
+                  onClick={pickAll}
+                  disabled={lineup.length === pool.length}
                 >
-                  {fullName(player)}
-                </span>
-                <div className="flex items-center gap-3 shrink-0">
-                  <span
-                    className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-full px-2 py-0.5"
-                    style={{ fontFamily: "Inter" }}
-                    title="ELO rating"
+                  Select all
+                </button>
+                <button
+                  className="text-emerald-700 hover:text-emerald-800 disabled:text-gray-300"
+                  onClick={pickNone}
+                  disabled={lineup.length === 0}
+                >
+                  Clear
+                </button>
+              </span>
+            </div>
+            <ul className="space-y-2">
+              {pool.map((player) => {
+                const isPicked = picked.has(player._id);
+                return (
+                  <li
+                    key={player._id}
+                    className={`flex items-center justify-between gap-3 border rounded-xl px-4 py-2.5 transition-colors ${
+                      isPicked
+                        ? "bg-emerald-50 border-emerald-200"
+                        : "bg-gray-50 border-gray-100"
+                    }`}
                   >
-                    {player.elo}
-                  </span>
-                  <span
-                    className="text-xs text-gray-400"
-                    style={{ fontFamily: "Inter" }}
-                    title="Wins – losses"
-                  >
-                    {player.wins}W&nbsp;{player.losses}L
-                  </span>
-                  <button
-                    className="text-gray-300 hover:text-red-400 transition-colors text-lg leading-none"
-                    onClick={() => handleRemove(player._id)}
-                    aria-label={`Remove ${fullName(player)}`}
-                  >
-                    &times;
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
+                    <label className="flex items-center gap-3 min-w-0 cursor-pointer flex-1">
+                      <input
+                        type="checkbox"
+                        checked={isPicked}
+                        onChange={() => togglePicked(player._id)}
+                        className="w-4 h-4 shrink-0 accent-emerald-600"
+                      />
+                      <span
+                        className={`text-sm truncate ${isPicked ? "text-gray-800" : "text-gray-400"}`}
+                        style={{ fontFamily: "Inter" }}
+                      >
+                        {fullName(player)}
+                      </span>
+                    </label>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span
+                        className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-full px-2 py-0.5"
+                        style={{ fontFamily: "Inter" }}
+                        title="ELO rating"
+                      >
+                        {player.elo}
+                      </span>
+                      <span
+                        className="text-xs text-gray-400"
+                        style={{ fontFamily: "Inter" }}
+                        title="Wins – losses"
+                      >
+                        {player.wins}W&nbsp;{player.losses}L
+                      </span>
+                      <button
+                        className="text-gray-300 hover:text-red-400 transition-colors text-lg leading-none"
+                        onClick={() => handleRemove(player._id)}
+                        aria-label={`Remove ${fullName(player)}`}
+                      >
+                        &times;
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
         )}
       </div>
 
@@ -254,17 +378,25 @@ function PoolView({ onOpenMatch }) {
           {teams ? "Redraw teams" : "Draw teams"}
         </button>
 
+        {canDraw && (
+          <p className="text-center text-xs text-gray-400" style={{ fontFamily: "Inter" }}>
+            Teams are balanced by ELO, with a bit of randomness each draw.
+          </p>
+        )}
+
         {!canDraw && !isLoading && (
           <p className="text-center text-sm text-gray-400" style={{ fontFamily: "Inter" }}>
-            Add at least 2 players to draw teams.
+            {pool.length < 2
+              ? "Add at least 2 players to draw teams."
+              : "Tick at least 2 players to draw teams."}
           </p>
         )}
 
         {teams && (
           <>
             <div className="grid grid-cols-2 gap-4">
-              <TeamCard title="Colours" players={teams.a} accent="bg-orange-50 border-orange-200 text-orange-900" badge="bg-orange-400" />
-              <TeamCard title="Whites" players={teams.b} accent="bg-slate-50 border-slate-200 text-slate-900" badge="bg-slate-400" />
+              <TeamCard title="Colours" players={teams.a} accent="bg-orange-50 border-orange-200 text-orange-900" badge="bg-orange-400" chance={chances?.a} />
+              <TeamCard title="Whites" players={teams.b} accent="bg-slate-50 border-slate-200 text-slate-900" badge="bg-slate-400" chance={chances?.b} />
             </div>
             <button
               className="w-full border border-emerald-600 text-emerald-700 hover:bg-emerald-50 active:scale-[0.98] py-3 px-6 rounded-xl font-medium tracking-wide transition-all duration-200 disabled:opacity-50"
@@ -324,13 +456,13 @@ function PoolView({ onOpenMatch }) {
       </div>
 
       <p className="text-center text-gray-300 text-xs leading-relaxed" style={{ fontFamily: "Inter" }}>
-        Coming soon: ELO changes after matches and saved seasons.
+        Coming soon: saved seasons.
       </p>
     </Shell>
   );
 }
 
-function TeamCard({ title, players, accent, badge }) {
+function TeamCard({ title, players, accent, badge, chance }) {
   return (
     <div className={`rounded-2xl border p-4 ${accent}`}>
       <div className="flex items-center gap-2 mb-3">
@@ -353,6 +485,7 @@ function TeamCard({ title, players, accent, badge }) {
       </ul>
       <p className="text-xs opacity-60 mt-3" style={{ fontFamily: "Inter" }}>
         Avg ELO {avgElo(players)}
+        {chance != null && <> &middot; Win chance {Math.round(chance * 100)}%</>}
       </p>
     </div>
   );
@@ -405,6 +538,7 @@ function MatchView({ matchId, onBack }) {
 
   const onTeam = new Set([...teamA, ...teamB].map((p) => p._id));
   const bench = (players ?? []).filter((p) => !onTeam.has(p._id));
+  const chances = matchupChances(teamA, teamB);
 
   const dropFrom = (setter) => (id) =>
     setter((list) => list.filter((p) => p._id !== id));
@@ -485,6 +619,7 @@ function MatchView({ matchId, onBack }) {
           moveLabel="Move to Whites"
           onMove={toB}
           onBench={benchPlayer}
+          chance={chances?.a}
         />
         <EditableTeam
           title="Whites"
@@ -494,6 +629,7 @@ function MatchView({ matchId, onBack }) {
           moveLabel="Move to Colours"
           onMove={toA}
           onBench={benchPlayer}
+          chance={chances?.b}
         />
       </div>
 
@@ -592,7 +728,7 @@ function MatchView({ matchId, onBack }) {
   );
 }
 
-function EditableTeam({ title, badge, accent, players, moveLabel, onMove, onBench }) {
+function EditableTeam({ title, badge, accent, players, moveLabel, onMove, onBench, chance }) {
   return (
     <div className={`rounded-2xl border p-4 ${accent}`}>
       <div className="flex items-center gap-2 mb-3">
@@ -638,6 +774,7 @@ function EditableTeam({ title, badge, accent, players, moveLabel, onMove, onBenc
       </ul>
       <p className="text-xs opacity-60 mt-3" style={{ fontFamily: "Inter" }}>
         Avg ELO {avgElo(players)}
+        {chance != null && <> &middot; Win chance {Math.round(chance * 100)}%</>}
       </p>
     </div>
   );

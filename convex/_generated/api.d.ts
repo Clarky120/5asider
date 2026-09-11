@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as elo from "../elo.js";
 import type * as matches from "../matches.js";
 import type * as players from "../players.js";
 
@@ -18,6 +19,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  elo: typeof elo;
   matches: typeof matches;
   players: typeof players;
 }>;

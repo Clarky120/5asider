@@ -1,5 +1,6 @@
 import { query, mutation } from "./_generated/server";
 import { v } from "convex/values";
+import { calculateEloDelta } from "./elo";
 
 const winnerValidator = v.union(
   v.literal("a"),
@@ -42,22 +43,46 @@ function validateTeams(teamA, teamB) {
   }
 }
 
+function average(nums) {
+  return nums.length ? nums.reduce((sum, n) => sum + n, 0) / nums.length : 0;
+}
+
+/** Move every player on one team by one outcome's worth of stats + rating. */
+async function adjustTeam(ctx, docs, outcome, opponentAvgElo, delta) {
+  for (const p of docs) {
+    if (!p) continue;
+    const patch = {};
+    if (outcome === "win") patch.wins = Math.max(0, p.wins + delta);
+    if (outcome === "loss") patch.losses = Math.max(0, p.losses + delta);
+    const eloDelta = calculateEloDelta(p.elo, opponentAvgElo, outcome);
+    if (eloDelta) patch.elo = p.elo + eloDelta * delta;
+    if (Object.keys(patch).length) await ctx.db.patch(p._id, patch);
+  }
+}
+
 /**
  * Add (delta = +1) or reverse (delta = -1) a recorded result against the
- * given rosters. Draws don't move the win/loss counters.
+ * given rosters. Draws don't move the win/loss counters, but still feed
+ * into the ELO placeholder above. Both teams' ratings are snapshotted
+ * before either is patched, so ELO deltas are computed from pre-match
+ * ratings on both sides rather than one team seeing the other's post-match
+ * rating.
  */
 async function applyResult(ctx, teamA, teamB, winner, delta) {
-  if (!winner || winner === "draw") return;
-  const winners = winner === "a" ? teamA : teamB;
-  const losers = winner === "a" ? teamB : teamA;
-  for (const id of winners) {
-    const p = await ctx.db.get(id);
-    if (p) await ctx.db.patch(id, { wins: Math.max(0, p.wins + delta) });
-  }
-  for (const id of losers) {
-    const p = await ctx.db.get(id);
-    if (p) await ctx.db.patch(id, { losses: Math.max(0, p.losses + delta) });
-  }
+  if (!winner) return;
+
+  const [docsA, docsB] = await Promise.all([
+    Promise.all(teamA.map((id) => ctx.db.get(id))),
+    Promise.all(teamB.map((id) => ctx.db.get(id))),
+  ]);
+  const avgEloA = average(docsA.filter(Boolean).map((p) => p.elo));
+  const avgEloB = average(docsB.filter(Boolean).map((p) => p.elo));
+
+  const outcomeFor = (side) =>
+    winner === "draw" ? "draw" : winner === side ? "win" : "loss";
+
+  await adjustTeam(ctx, docsA, outcomeFor("a"), avgEloB, delta);
+  await adjustTeam(ctx, docsB, outcomeFor("b"), avgEloA, delta);
 }
 
 export const list = query({
